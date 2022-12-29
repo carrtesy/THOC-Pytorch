@@ -36,7 +36,7 @@ class THOC(nn.Module):
         )
 
         self.TSSnets = nn.ModuleList([
-            nn.Linear(n_hidden, C) for l in range(self.L)
+            nn.Linear(n_hidden, C) for _ in range(self.L)
         ])
 
     def forward(self, X):
