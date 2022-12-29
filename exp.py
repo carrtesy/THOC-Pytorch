@@ -66,8 +66,9 @@ class THOCTrainer:
         X = batch_data[0].to(self.args.device)
         B, L, C = X.shape
 
-        loss_dict = self.model(X.reshape(B, L, C))
-        out.update(loss_dict)
+        anomaly_score, loss_dict = self.model(X)
+        for k in loss_dict:
+            out.update({k: loss_dict[k].item()})
 
         self.optimizer.zero_grad()
         loss = loss_dict["L_THOC"] + self.args.LAMBDA_orth * loss_dict["L_orth"] + self.args.LAMBDA_TSS * loss_dict["L_TSS"]
@@ -141,10 +142,12 @@ class THOCTrainer:
         for i, batch_data in enumerate(eval_iterator):
             X = batch_data[0].to(self.args.device)
             B, L, C = X.shape
-            loss_dict = self.model(X.reshape(B, L, C))
-            anomaly_scores.append(loss_dict["L_THOC"])
-        first_pred = anomaly_scores[0].repeat(self.args.window_size-1)
-        anomaly_scores = torch.cat((first_pred, anomaly_scores), dim=0)
+            anomaly_score, loss_dict = self.model(X)
+            anomaly_scores.append(anomaly_score)
+
+        anomaly_scores = torch.cat(anomaly_scores, dim=0)
+        init_pred = anomaly_scores[0].repeat(self.args.window_size-1)
+        anomaly_scores = torch.cat((init_pred, anomaly_scores)).cpu().numpy()
         return anomaly_scores
 
     def get_threshold(self, gt, anomaly_scores):

@@ -9,18 +9,23 @@ class THOC(nn.Module):
         self.device = device
         self.C, self.W = C, W
         self.L = math.floor(math.log(W, 2)) + 1 # number of DRNN layers
+        self.tau = 1
         self.DRNN = DRNN(n_input=C, n_hidden=n_hidden, n_layers=self.L, device=device)
-        self.clusters = [nn.Parameter(torch.zeros(n_hidden, K_l)) for K_l in range(self.L*2, 0, -2)]
+
+        self.clusters = nn.ParameterList([
+            nn.Parameter(torch.zeros(n_hidden, K_l))
+            for K_l in range(self.L*2, 0, -2)
+        ])
         for c in self.clusters:
             nn.init.xavier_uniform_(c)
 
-        self.tau = 1
-        self.cnets = [
+
+        self.cnets = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(n_hidden, n_hidden),
                 nn.ReLU(),
-            ) for l in range(self.L) # nn that maps f_bar to f_hat
-        ]
+            ) for _ in range(self.L) # nn that maps f_bar to f_hat
+        ])
 
         self.MLP = nn.Sequential(
             nn.Linear(n_hidden*2, n_hidden*2),
@@ -30,19 +35,21 @@ class THOC(nn.Module):
             nn.Linear(n_hidden, n_hidden)
         )
 
-        self.TSSnets = [
+        self.TSSnets = nn.ModuleList([
             nn.Linear(n_hidden, C) for l in range(self.L)
-        ]
+        ])
 
     def forward(self, X):
         '''
-        :param X: (B, L, C)
+        :param X: (B, W, C)
         :return: Losses,
         '''
+        B, W, C = X.shape
         MTF_output = self.DRNN(X) # Multiscale Temporal Features from dilated RNN.
 
         # THOC
         L_THOC = 0
+        anomaly_scores = torch.zeros(B, device=self.device)
         f_t_bar = MTF_output[0][:, -1, :].unsqueeze(1)
         Ps, Rs = [], []
 
@@ -50,7 +57,7 @@ class THOC(nn.Module):
             # Assignment
             eps = 1e-08
             f_norm, c_norm = torch.norm(f_t_bar, dim=-1, keepdim=True), torch.norm(cluster, dim=0, keepdim=True)
-            f_norm, c_norm = torch.max(f_norm, eps*torch.ones_like(f_norm).to(self.device)), torch.max(c_norm, eps*torch.ones_like(c_norm).to(self.device))
+            f_norm, c_norm = torch.max(f_norm, eps*torch.ones_like(f_norm, device=self.device)), torch.max(c_norm, eps*torch.ones_like(c_norm, device=self.device))
             cosine_similarity = torch.einsum(
                 "Bph,hn->Bpn", f_t_bar / f_norm, cluster/c_norm
             )
@@ -76,14 +83,16 @@ class THOC(nn.Module):
             d = 1 - cosine_similarity
             w = R_ij.unsqueeze(1).repeat(1, num_prev_clusters, 1)
             distances = w * d
+            anomaly_scores += torch.mean(distances, dim=(1, 2))
             L_THOC += torch.mean(distances)
+        anomaly_scores /= len(self.clusters)
 
         # ORTH
         L_orth = 0
         for cluster in self.clusters:
             c_sq = cluster.T @ cluster #(K_l, K_l)
             K_l, _ = c_sq.shape
-            L_orth += torch.linalg.matrix_norm(c_sq-torch.eye(K_l))
+            L_orth += torch.linalg.matrix_norm(c_sq-torch.eye(K_l, device=self.device))
         L_orth /= len(self.clusters)
 
         # TSS
@@ -93,11 +102,12 @@ class THOC(nn.Module):
             L_TSS += F.mse_loss(net(src), tgt)
         L_TSS /= len(self.TSSnets)
 
-        return {
+        loss_dict = {
             "L_THOC": L_THOC,
             "L_orth": L_orth,
-            "L_TSS": L_TSS
+            "L_TSS": L_TSS,
         }
+        return anomaly_scores, loss_dict
 
 # Dilated RNN code modified from:
 # https://github.com/zalandoresearch/pytorch-dilated-rnn/blob/master/drnn.py

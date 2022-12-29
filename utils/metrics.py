@@ -26,4 +26,4 @@ def PA(y, y_pred):
             anomaly_state = False
         if anomaly_state:
             y_pred_pa[i] = 1
-    return
+    return y_pred_pa

@@ -12,6 +12,8 @@ from exp import THOCTrainer
 from utils.tools import SEED_everything
 SEED_everything(42)
 
+from secret import WANDB_API_KEY
+
 # parse arguments
 parser = argparse.ArgumentParser(description='THOC-Pytorch')
 
@@ -54,7 +56,7 @@ args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 args.model = "THOC"
 
 # wandb
-wandb.login(key="acb532aa952481a8035be072cee41b4eba493f8d")
+wandb.login(key=WANDB_API_KEY)
 WANDB_PROJECT_NAME, WANDB_ENTITY = "THOC-Pytorch", "carrtesy"
 wandb.init(project=WANDB_PROJECT_NAME, entity=WANDB_ENTITY, name=args.exp_id)
 wandb.config.update(args)
