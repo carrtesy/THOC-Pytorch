@@ -4,12 +4,16 @@ import torch.nn.functional as F
 import math
 
 class THOC(nn.Module):
-    def __init__(self, C, W, n_hidden, tau=1):
+    def __init__(self, C, W, n_hidden, tau=1, device="cpu"):
+        super(THOC, self).__init__()
+        self.device = device
+        self.C, self.W = C, W
         self.L = math.floor(math.log(W, 2)) + 1 # number of DRNN layers
-        self.DRNN = DRNN(n_input=C, n_hidden=n_hidden, n_layers=self.L)
-        self.clusters = [nn.parameter(n_hidden, K_l) for K_l in range(self.L*2, 0, -2)]
+        self.DRNN = DRNN(n_input=C, n_hidden=n_hidden, n_layers=self.L, device=device)
+        self.clusters = [nn.Parameter(torch.zeros(n_hidden, K_l)) for K_l in range(self.L*2, 0, -2)]
         for c in self.clusters:
             nn.init.xavier_uniform_(c)
+
         self.tau = 1
         self.cnets = [
             nn.Sequential(
@@ -17,10 +21,8 @@ class THOC(nn.Module):
                 nn.ReLU(),
             ) for l in range(self.L) # nn that maps f_bar to f_hat
         ]
-        for n in self.cnets:
-            nn.init.xavier_uniform_(n)
 
-        self.mlp = nn.Sequential(
+        self.MLP = nn.Sequential(
             nn.Linear(n_hidden*2, n_hidden*2),
             nn.ReLU(),
             nn.Linear(n_hidden*2, n_hidden),
@@ -29,8 +31,7 @@ class THOC(nn.Module):
         )
 
         self.TSSnets = [
-            nn.parameter(W-2**l)
-            for l in range(self.L)
+            nn.Linear(n_hidden, C) for l in range(self.L)
         ]
 
     def forward(self, X):
@@ -42,30 +43,45 @@ class THOC(nn.Module):
 
         # THOC
         L_THOC = 0
-        f_t_bar = MTF_output[0][:, -1, :]
+        f_t_bar = MTF_output[0][:, -1, :].unsqueeze(1)
         Ps, Rs = [], []
 
-        for i, c in enumerate(self.clusters):
-            layer_output = F.cosine_similarity(f_t_bar, c)  # (B, num_cluster_{l-1}, hidden_dim) @ (hidden_dim, num_cluster_{l})
-            P_ij = F.softmax(layer_output/self.tau, dim=-1) # (B, num_cluster_{l-1}, num_cluster_{l})
-            R_ij = P_ij if len(Ps)==0 else Rs[i-1] @ P_ij
+        for i, cluster in enumerate(self.clusters):
+            # Assignment
+            eps = 1e-08
+            f_norm, c_norm = torch.norm(f_t_bar, dim=-1, keepdim=True), torch.norm(cluster, dim=0, keepdim=True)
+            f_norm, c_norm = torch.max(f_norm, eps*torch.ones_like(f_norm).to(self.device)), torch.max(c_norm, eps*torch.ones_like(c_norm).to(self.device))
+            cosine_similarity = torch.einsum(
+                "Bph,hn->Bpn", f_t_bar / f_norm, cluster/c_norm
+            )
+
+            P_ij = F.softmax(cosine_similarity/self.tau, dim=-1) # (B, num_cluster_{l-1}, num_cluster_{l})
+            R_ij = P_ij.squeeze(1) if len(Ps)==0 \
+                else torch.einsum("Bp,Bpn->Bn", Rs[i-1], P_ij)
             Ps.append(P_ij)
             Rs.append(R_ij)
 
+            # Update
             c_vectors = self.cnets[i](f_t_bar) # (B, num_cluster_{l-1}, hidden_dim)
-            f_t_bar = P_ij.transpose(-1, -2) @ c_vectors # (B, num_cluster_{l}, hidden_dim)
-            if i != self.L-1:
-                f_t_bar = self.MLP(torch.cat((f_t_bar, torch.repeat(MTF_output)[i + 1][:, -1, :].repeat(1, len(c), 1)), dim=-1))
+            f_t_bar = torch.einsum(
+                "Bnp,Bph->Bnh", P_ij.transpose(-1, -2), c_vectors
+            ) # (B, num_cluster_{l}, hidden_dim)
 
-            cosine_similarity = (f_t_bar / (torch.norm(f_t_bar, dim=-1) + 1e-08)) @ (c / (torch.norm(f_t_bar, dim=0) + 1e-08))
+            # fuse last hidden state
+            B, num_prev_clusters, num_next_clusters = P_ij.shape
+            if i != self.L-1:
+                last_hidden_state = MTF_output[i + 1][:, -1, :].unsqueeze(1).repeat(1, num_next_clusters, 1)
+                f_t_bar = self.MLP(torch.cat((f_t_bar, last_hidden_state), dim=-1))
+
             d = 1 - cosine_similarity
-            distances = R_ij * d
+            w = R_ij.unsqueeze(1).repeat(1, num_prev_clusters, 1)
+            distances = w * d
             L_THOC += torch.mean(distances)
 
         # ORTH
         L_orth = 0
-        for c in self.clusters:
-            c_sq = c.T @ c #(K_l, K_l)
+        for cluster in self.clusters:
+            c_sq = cluster.T @ cluster #(K_l, K_l)
             K_l, _ = c_sq.shape
             L_orth += torch.linalg.matrix_norm(c_sq-torch.eye(K_l))
         L_orth /= len(self.clusters)
@@ -73,8 +89,9 @@ class THOC(nn.Module):
         # TSS
         L_TSS = 0
         for i, net in enumerate(self.TSSnets):
-            src, tgt = X[:, :2**(i), :], X[:, -2**(i):, :]
-            L_TSS += F.mse_loss(src*net, tgt)
+            src, tgt = MTF_output[i][:, :-2**(i), :], X[:, 2**(i):, :]
+            L_TSS += F.mse_loss(net(src), tgt)
+        L_TSS /= len(self.TSSnets)
 
         return {
             "L_THOC": L_THOC,
@@ -85,12 +102,13 @@ class THOC(nn.Module):
 # Dilated RNN code modified from:
 # https://github.com/zalandoresearch/pytorch-dilated-rnn/blob/master/drnn.py
 class DRNN(nn.Module):
-    def __init__(self, n_input, n_hidden, n_layers, dropout=0, cell_type='GRU', batch_first=True):
+    def __init__(self, n_input, n_hidden, n_layers, dropout=0, cell_type='GRU', batch_first=True, device="cpu"):
         super(DRNN, self).__init__()
 
         self.dilations = [2 ** i for i in range(n_layers)]
         self.cell_type = cell_type
         self.batch_first = batch_first
+        self.device = device
 
         layers = []
         if self.cell_type == "GRU":
@@ -175,7 +193,7 @@ class DRNN(nn.Module):
 
             zeros_ = torch.zeros(dilated_steps * rate - inputs.size(0),
                                  inputs.size(1),
-                                 inputs.size(2))
+                                 inputs.size(2)).to(self.device)
 
             inputs = torch.cat((inputs, zeros_))
         else:
@@ -188,9 +206,9 @@ class DRNN(nn.Module):
         return dilated_inputs
 
     def init_hidden(self, batch_size, hidden_dim):
-        hidden = torch.zeros(batch_size, hidden_dim)
+        hidden = torch.zeros(batch_size, hidden_dim).to(self.device)
         if self.cell_type == "LSTM":
-            memory = torch.zeros(batch_size, hidden_dim)
+            memory = torch.zeros(batch_size, hidden_dim).to(self.device)
             return (hidden, memory)
         else:
             return hidden
