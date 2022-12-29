@@ -1,0 +1,33 @@
+program: main.py
+method: bayes
+name: MSL_v1
+project: THOC-Pytorch
+entity: carrtesy
+metric:
+  name: F1 (PA)
+  goal: maximize
+parameters:
+  lr:
+    min: 0.0001
+    max: 0.1
+  window_size:
+    min: 12
+    max: 96
+  L2_reg:
+    min: 0.0
+    max: 2.0
+  LAMBDA_orth:
+    min: 0.0
+    max: 2.0
+  LAMBDA_TSS:
+    min: 0.0
+    max: 2.0
+  epochs:
+    value: 30
+  dataset:
+    value: "MSL"
+
+early_terminate:
+  type: hyperband
+  max_iter: 100
+  s: 3

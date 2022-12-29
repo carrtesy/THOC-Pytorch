@@ -54,6 +54,8 @@ os.makedirs(args.output_path, exist_ok=True)
 args.home_dir = "."
 args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 args.model = "THOC"
+args.exp_id = f"{args.model}_data_{args.dataset}_lr_{args.lr:.5f}_ws_{args.window_size}_l2_{args.L2_reg}"
+args.exp_id += f"_orth_{args.LAMBDA_orth}_tss_{args.LAMBDA_TSS}"
 
 # wandb
 wandb.login(key=WANDB_API_KEY)
